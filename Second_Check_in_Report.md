@@ -1,7 +1,7 @@
 # Second Check-in Report: Adaptive Maze Navigation
 
 **Course:** COSC 4368 AI Spring 2026  
-**Student/Team Name:** [Tu Nombre / Equipo]  
+**Team Number:** 14 
 
 ## 1. Introduction and Objectives
 For the Second Check-in of the Silent Cartographer project, the primary objectives were to load the maze environment into Python, implement a naive solver for the hazard-free maze, visualize the solution, load the hazards into the framework, and demonstrate that the hazard mechanics function exactly as outlined in the provided API specifications.
