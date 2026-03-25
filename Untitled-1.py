@@ -1,21 +1,3 @@
-"""
-Checkpoint 2: Maze Solving + Hazard System
--------------------------------------------
-Fully matches assignment spec:
-
-1. Load maze (64x64 cell graph, h_walls + v_walls)
-2. Solve with BFS (no hazards)
-3. Visualize solution
-4. Load hazards:
-     Fire (P)       - instant death, respawn at start. Rotates 90 CW each turn.
-     Confusion (C)  - inverts ALL moves for rest of current turn + full next turn
-     Teleport pairs - Green<->Asterisk, Yellow<->Star, Purple<->Hexagram
-5. TurnResult object returned after every turn (matches spec exactly)
-6. Agent submits 1-5 actions per turn, executed sequentially
-   (stops early on death or goal)
-7. Hazard demonstration
-"""
-
 from __future__ import annotations
 from dataclasses import dataclass
 from collections import deque
@@ -26,7 +8,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import random
 
-# ── Maze layout constants ─────────────────────────────────────────────────────
+
 MAZE_FILE = "MAZE_0.png"
 GRID   = 64
 WALL   = 2
@@ -111,9 +93,8 @@ class TurnResult:
     actions_executed: int              # actions completed before death/goal
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+
 # PART 1: Load maze
-# ══════════════════════════════════════════════════════════════════════════════
 
 def cell_center(row: int, col: int) -> Tuple[int, int]:
     """Returns pixel (x, y) of the center of a logical cell."""
@@ -169,9 +150,7 @@ def can_move(h_walls, v_walls, row: int, col: int, action: str) -> bool:
     return True  # WAIT always valid
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # PART 2: BFS solve (no hazards)
-# ══════════════════════════════════════════════════════════════════════════════
 
 def bfs(h_walls, v_walls, start: Tuple, goal: Tuple) -> List[Tuple]:
     """BFS on cell graph. Returns shortest path as list of (row, col)."""
@@ -204,9 +183,9 @@ def bfs(h_walls, v_walls, start: Tuple, goal: Tuple) -> List[Tuple]:
     return path
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+
 # PART 3: Visualize BFS solution
-# ══════════════════════════════════════════════════════════════════════════════
+
 
 def visualize_solution(image, path, start, goal, out_path: str):
     """Draws BFS path + start/goal markers and saves image."""
