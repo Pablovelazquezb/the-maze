@@ -1,9 +1,12 @@
 import { useState, useEffect } from 'react'
 import MazeVisualizer from './components/MazeVisualizer'
+import demoDataBeta from './assets/demo_data.json'
+import demoDataGamma from './assets/demo_data_gamma.json'
 import './index.css'
 
 function App() {
   const [currentSlide, setCurrentSlide] = useState(0)
+  const [activeMaze, setActiveMaze] = useState('beta')
 
   const slides = [
     // Slide 0: Title
@@ -72,17 +75,28 @@ function App() {
       <div className="w-full max-w-6xl flex justify-between items-end mb-6 px-4">
         <div>
           <h2 className="text-4xl font-bold text-white">Live Execution</h2>
-          <p className="text-slate-400">Zero-Shot Test on Maze Beta (Hazards enabled)</p>
+          <p className="text-slate-400">Zero-Shot Test Validation</p>
         </div>
-        <div className="bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-4 py-2 rounded-lg font-mono text-sm">
-          Status: Agent Loaded
+        <div className="flex space-x-2 bg-slate-800/50 p-1 rounded-xl border border-slate-700">
+          <button 
+            onClick={() => setActiveMaze('beta')}
+            className={`px-4 py-2 rounded-lg font-bold text-sm transition-all ${activeMaze === 'beta' ? 'bg-purple-500 text-white shadow-lg shadow-purple-500/25' : 'text-slate-400 hover:text-white'}`}
+          >
+            Maze Beta
+          </button>
+          <button 
+            onClick={() => setActiveMaze('gamma')}
+            className={`px-4 py-2 rounded-lg font-bold text-sm transition-all ${activeMaze === 'gamma' ? 'bg-blue-500 text-white shadow-lg shadow-blue-500/25' : 'text-slate-400 hover:text-white'}`}
+          >
+            Maze Gamma
+          </button>
         </div>
       </div>
-      <MazeVisualizer />
+      <MazeVisualizer demoData={activeMaze === 'beta' ? demoDataBeta : demoDataGamma} />
     </div>,
 
     // Slide 4: Results
-    <div className="flex flex-col h-full justify-center max-w-5xl mx-auto space-y-10 animate-fade-in">
+    <div className="flex flex-col h-full justify-center max-w-6xl mx-auto space-y-10 animate-fade-in">
       <h2 className="text-5xl font-bold text-white text-center mb-8">Performance Metrics</h2>
       
       <div className="overflow-hidden rounded-3xl border border-slate-700 shadow-2xl bg-slate-800/50 backdrop-blur-sm">
@@ -91,7 +105,8 @@ function App() {
             <tr className="bg-slate-900/80">
               <th className="p-6 text-slate-300 font-semibold text-lg border-b border-slate-700">Metric</th>
               <th className="p-6 text-slate-300 font-semibold text-lg border-b border-slate-700">Maze Alpha (Train)</th>
-              <th className="p-6 text-emerald-400 font-bold text-lg border-b border-slate-700 bg-emerald-950/20">Maze Beta (Zero-Shot Test)</th>
+              <th className="p-6 text-emerald-400 font-bold text-lg border-b border-slate-700 bg-emerald-950/20">Maze Beta (Test)</th>
+              <th className="p-6 text-blue-400 font-bold text-lg border-b border-slate-700 bg-blue-950/20">Maze Gamma (Test)</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-700/50 text-slate-300 text-lg">
@@ -99,27 +114,31 @@ function App() {
               <td className="p-6 font-medium">Success Rate</td>
               <td className="p-6">92.5%</td>
               <td className="p-6 text-emerald-400 font-bold bg-emerald-950/10">100.0%</td>
+              <td className="p-6 text-blue-400 font-bold bg-blue-950/10">75.0%</td>
             </tr>
             <tr className="hover:bg-slate-800/50 transition-colors">
               <td className="p-6 font-medium">Avg Turns to Solution</td>
               <td className="p-6">8080.2</td>
               <td className="p-6 text-emerald-400 font-bold bg-emerald-950/10">251.2</td>
+              <td className="p-6 text-blue-400 font-bold bg-blue-950/10">2339.1</td>
             </tr>
             <tr className="hover:bg-slate-800/50 transition-colors">
               <td className="p-6 font-medium">Death Rate</td>
               <td className="p-6">0.0001</td>
               <td className="p-6 text-emerald-400 font-bold bg-emerald-950/10">0.0000</td>
+              <td className="p-6 text-blue-400 font-bold bg-blue-950/10">0.0006</td>
             </tr>
             <tr className="hover:bg-slate-800/50 transition-colors">
               <td className="p-6 font-medium">Exploration Efficiency</td>
               <td className="p-6">0.106</td>
               <td className="p-6 text-emerald-400 font-bold bg-emerald-950/10">0.903</td>
+              <td className="p-6 text-blue-400 font-bold bg-blue-950/10">0.245</td>
             </tr>
           </tbody>
         </table>
       </div>
       <p className="text-center text-slate-400 text-xl pt-4">
-        The model successfully generalized avoiding all dynamic hazards in a new environment without retraining!
+        The model successfully generalized across completely new hazard placements in both Beta and Gamma mazes!
       </p>
     </div>
   ]

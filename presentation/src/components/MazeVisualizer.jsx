@@ -1,13 +1,17 @@
 import React, { useState, useEffect, useRef } from 'react';
-import demoData from '../assets/demo_data.json';
-
-const MazeVisualizer = () => {
+const MazeVisualizer = ({ demoData }) => {
   const [currentStep, setCurrentStep] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [speed, setSpeed] = useState(50); // ms per step
   
   const { walls, pits, teleporters, confusion_pads, start_pos, goal_pos, path } = demoData;
   const maxSteps = path.length - 1;
+
+  // Reset when demoData changes
+  useEffect(() => {
+    setIsPlaying(false);
+    setCurrentStep(0);
+  }, [demoData]);
 
   // Use a ref for auto-play interval
   const timerRef = useRef(null);
