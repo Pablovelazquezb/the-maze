@@ -170,8 +170,8 @@ function App() {
       </div>
 
       {/* Navigation Footer */}
-      <div className="absolute bottom-8 left-0 w-full flex justify-between items-center px-12 z-20">
-        <div className="flex space-x-2">
+      <div className="absolute bottom-8 left-0 w-full flex justify-between items-center px-12 z-20 pointer-events-none">
+        <div className="flex space-x-2 pointer-events-auto">
           {slides.map((_, i) => (
             <div 
               key={i} 
@@ -179,7 +179,7 @@ function App() {
             />
           ))}
         </div>
-        <div className="flex space-x-4">
+        <div className="flex space-x-4 pointer-events-auto">
           <button 
             onClick={prevSlide}
             disabled={currentSlide === 0}
