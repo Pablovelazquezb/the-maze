@@ -1,14 +1,39 @@
-from typing import List, Tuple
+"""
+Maze Environment — COSC 4368 Spring 2026
+Supports: walls, death pits (fire with rotation), teleporters, confusion pads
+Fire/death pits rotate 90° clockwise every 5 actions (pivot = bottom of V shape).
+"""
+
+from typing import List, Tuple, Dict, Optional
 from enum import Enum
-import random
+from collections import deque
+import random, math
 
+# ── Actions ───────────────────────────────────────────────────────────────────
 class Action(Enum):
-    MOVE_UP = 0
-    MOVE_DOWN = 1
-    MOVE_LEFT = 2
+    MOVE_UP    = 0
+    MOVE_DOWN  = 1
+    MOVE_LEFT  = 2
     MOVE_RIGHT = 3
-    WAIT = 4
+    WAIT       = 4
 
+ACTION_DELTA = {
+    Action.MOVE_UP:    ( 0, -1),
+    Action.MOVE_DOWN:  ( 0,  1),
+    Action.MOVE_LEFT:  (-1,  0),
+    Action.MOVE_RIGHT: ( 1,  0),
+    Action.WAIT:       ( 0,  0),
+}
+
+CONFUSED_MAP = {
+    Action.MOVE_UP:    Action.MOVE_DOWN,
+    Action.MOVE_DOWN:  Action.MOVE_UP,
+    Action.MOVE_LEFT:  Action.MOVE_RIGHT,
+    Action.MOVE_RIGHT: Action.MOVE_LEFT,
+    Action.WAIT:       Action.WAIT,
+}
+
+# ── Turn Result ───────────────────────────────────────────────────────────────
 class TurnResult:
     def __init__(self):
         self.wall_hits: int = 0
@@ -19,43 +44,37 @@ class TurnResult:
         self.teleported: bool = False
         self.actions_executed: int = 0
 
+# ── Agent base class ─────────────────────────────────────────────────────────
 class Agent:
-    """
-    Base class for student implementations
-    Students must implement this interface
-    """
     def __init__(self):
         self.memory = {}
-        
     def plan_turn(self, last_result: TurnResult) -> List[Action]:
-        raise NotImplementedError("Students must implement this method")
-        
+        raise NotImplementedError
     def reset_episode(self):
         pass
 
+# ── Maze Environment ─────────────────────────────────────────────────────────
 class MazeEnvironment:
     def __init__(self, maze_id: str, max_turns: int = 10000):
-        """
-        Initialize maze environment
-        maze_id: Path to the generated text maze (e.g., 'maze_0.txt', 'maze_1.txt')
-        """
         self.maze_id = maze_id
         self.max_turns = max_turns
+
         with open(maze_id, 'r') as f:
-            self.text_maze = [list(line.strip('\n')) for line in f.readlines()]
-            
-        self.start_pos = (0, 0)
-        self.teleporters = []
-        self.pits = []
-        self.confusion_pads = []
-        self.goal = (0, 0)
-        
-        # logical grid is 64x64
+            self.text_maze = [list(line.rstrip('\n')) for line in f.readlines()]
+
+        self.start_pos = None
+        self.goal = None
+        self.teleporters: List[Tuple[int,int]] = []
+        self.pits: List[Tuple[int,int]] = []
+        self.confusion_pads: List[Tuple[int,int]] = []
+
+        # Parse cells
         for y in range(64):
             for x in range(64):
                 cell = self._get_cell(x, y)
                 if cell == 'S':
-                    self.start_pos = (x, y)
+                    if self.start_pos is None:
+                        self.start_pos = (x, y)
                 elif cell == 'G':
                     self.goal = (x, y)
                 elif cell == 'T':
@@ -64,119 +83,141 @@ class MazeEnvironment:
                     self.pits.append((x, y))
                 elif cell == 'C':
                     self.confusion_pads.append((x, y))
-                    
-        # Check and inject missing features
-        empty_cells = []
-        for y in range(64):
-            for x in range(64):
-                if self._get_cell(x, y) == 'O':
-                    empty_cells.append((x, y))
-                    
-        # Find largest connected component of empty cells to guarantee a valid path
-        visited_cc = set()
-        largest_cc = []
-        for sy in range(64):
-            for sx in range(64):
-                if (sx, sy) not in visited_cc and self._get_cell(sx, sy) == 'O':
-                    q = [(sx, sy)]
-                    cc = []
-                    visited_cc.add((sx, sy))
-                    while q:
-                        cx, cy = q.pop(0)
-                        cc.append((cx, cy))
-                        for a in [Action.MOVE_UP, Action.MOVE_DOWN, Action.MOVE_LEFT, Action.MOVE_RIGHT]:
-                            nx, ny = cx, cy
-                            if a == Action.MOVE_UP: ny -= 1
-                            elif a == Action.MOVE_DOWN: ny += 1
-                            elif a == Action.MOVE_LEFT: nx -= 1
-                            elif a == Action.MOVE_RIGHT: nx += 1
-                            if 0 <= nx < 64 and 0 <= ny < 64:
-                                if not self._has_wall(cx, cy, a) and (nx, ny) not in visited_cc:
-                                    visited_cc.add((nx, ny))
-                                    q.append((nx, ny))
-                    if len(cc) > len(largest_cc):
-                        largest_cc = cc
-        
-        # We need a predictable random for this injection
+
+        # Find largest connected component for injection
+        largest_cc = self._find_largest_cc()
+
         rng = random.Random(42)
-        
-        # Inject Start into the largest connected component if missing
-        if self.start_pos == (0, 0) and self._get_cell(0, 0) != 'S':
+
+        # Inject Start if missing
+        if self.start_pos is None:
             if largest_cc:
                 self.start_pos = largest_cc[0]
                 self._set_cell(*self.start_pos, 'S')
-                
+
         # Inject Goal if missing
-        if self.goal == (0, 0) and self._get_cell(0, 0) != 'G':
+        if self.goal is None:
             if largest_cc:
                 self.goal = largest_cc[-1]
                 self._set_cell(*self.goal, 'G')
-                
-        # If this is the "Maze with hazards" check-in, ensure hazards are present
-        if 'maze_1' in maze_id or 'maze_2' in maze_id:
+
+        # Inject hazards for maze_0 / maze_1 / maze_2 if missing
+        if True:  # Inject hazards for all mazes if missing
+            avail = [c for c in largest_cc if c != self.start_pos and c != self.goal]
             if len(self.pits) == 0:
                 for _ in range(10):
-                    if largest_cc:
-                        idx = rng.randint(0, len(largest_cc)-1)
-                        pos = largest_cc.pop(idx)
+                    if avail:
+                        pos = avail.pop(rng.randint(0, len(avail)-1))
                         self.pits.append(pos)
                         self._set_cell(*pos, 'P')
             if len(self.teleporters) == 0:
                 for _ in range(6):
-                    if largest_cc:
-                        idx = rng.randint(0, len(largest_cc)-1)
-                        pos = largest_cc.pop(idx)
+                    if avail:
+                        pos = avail.pop(rng.randint(0, len(avail)-1))
                         self.teleporters.append(pos)
                         self._set_cell(*pos, 'T')
             if len(self.confusion_pads) == 0:
                 for _ in range(5):
-                    if largest_cc:
-                        idx = rng.randint(0, len(largest_cc)-1)
-                        pos = largest_cc.pop(idx)
+                    if avail:
+                        pos = avail.pop(rng.randint(0, len(avail)-1))
                         self.confusion_pads.append(pos)
                         self._set_cell(*pos, 'C')
-                    
-        # Pair teleporters randomly but deterministically
+
+        # Pair teleporters
         random.seed(42)
-        self.teleport_map = {}
+        self.teleport_map: Dict[Tuple, Tuple] = {}
         if self.teleporters:
             sources = list(self.teleporters)
             dests = list(self.teleporters)
             random.shuffle(dests)
-            # Ensure no self-teleport if possible (one-way deterministic)
             for i in range(len(sources)):
                 if sources[i] == dests[i] and len(sources) > 1:
                     swap_idx = (i + 1) % len(sources)
                     dests[i], dests[swap_idx] = dests[swap_idx], dests[i]
             for s, d in zip(sources, dests):
                 self.teleport_map[s] = d
-                
+
+        # Fire rotation state: direction index (0=UP,1=RIGHT,2=DOWN,3=LEFT)
+        self.pit_directions: Dict[Tuple, int] = {}
+        for p in self.pits:
+            self.pit_directions[p] = 0  # initial direction = UP
+
+        self.total_actions_taken = 0
         self.reset()
-        
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
     def _get_cell(self, x: int, y: int) -> str:
-        # Prevent out-of-bounds just in case
-        if x < 0 or x >= 64 or y < 0 or y >= 64: return 'X'
+        if x < 0 or x >= 64 or y < 0 or y >= 64:
+            return 'X'
         return self.text_maze[y*2+1][x*2+1]
-        
+
     def _set_cell(self, x: int, y: int, char: str):
         if 0 <= x < 64 and 0 <= y < 64:
             self.text_maze[y*2+1][x*2+1] = char
-        
+
     def _has_wall(self, x: int, y: int, direction: Action) -> bool:
         if direction == Action.MOVE_UP:
-            if y == 0: return True
-            return self.text_maze[y*2][x*2+1] == 'X'
+            return y == 0 or self.text_maze[y*2][x*2+1] == 'X'
         elif direction == Action.MOVE_DOWN:
-            if y == 63: return True
-            return self.text_maze[y*2+2][x*2+1] == 'X'
+            return y == 63 or self.text_maze[y*2+2][x*2+1] == 'X'
         elif direction == Action.MOVE_LEFT:
-            if x == 0: return True
-            return self.text_maze[y*2+1][x*2] == 'X'
+            return x == 0 or self.text_maze[y*2+1][x*2] == 'X'
         elif direction == Action.MOVE_RIGHT:
-            if x == 63: return True
-            return self.text_maze[y*2+1][x*2+2] == 'X'
+            return x == 63 or self.text_maze[y*2+1][x*2+2] == 'X'
         return False
 
+    def _find_largest_cc(self):
+        visited = set()
+        largest = []
+        for sy in range(64):
+            for sx in range(64):
+                cell = self._get_cell(sx, sy)
+                if (sx, sy) not in visited and cell in ('O', 'S', 'G'):
+                    q = deque([(sx, sy)])
+                    cc = []
+                    visited.add((sx, sy))
+                    while q:
+                        cx, cy = q.popleft()
+                        cc.append((cx, cy))
+                        for a in [Action.MOVE_UP, Action.MOVE_DOWN, Action.MOVE_LEFT, Action.MOVE_RIGHT]:
+                            dx, dy = ACTION_DELTA[a]
+                            nx, ny = cx + dx, cy + dy
+                            if 0 <= nx < 64 and 0 <= ny < 64 and (nx, ny) not in visited:
+                                if not self._has_wall(cx, cy, a):
+                                    visited.add((nx, ny))
+                                    q.append((nx, ny))
+                        if len(cc) > len(largest):
+                            largest = cc
+        return largest
+
+    def _is_pit(self, x, y):
+        return (x, y) in self.pit_directions
+
+    def _rotate_fires(self):
+        """Rotate all fire pits 90° CW and move them one step in their direction."""
+        DIR_ACTIONS = [Action.MOVE_UP, Action.MOVE_RIGHT, Action.MOVE_DOWN, Action.MOVE_LEFT]
+        new_pits = {}
+        pits_set_old = set(self.pit_directions.keys())
+
+        for (px, py), dir_idx in list(self.pit_directions.items()):
+            new_dir = (dir_idx + 1) % 4
+            move_action = DIR_ACTIONS[dir_idx]
+            dx, dy = ACTION_DELTA[move_action]
+            nx, ny = px + dx, py + dy
+
+            if (0 <= nx < 64 and 0 <= ny < 64 and
+                not self._has_wall(px, py, move_action) and
+                (nx, ny) not in new_pits):
+                new_pits[(nx, ny)] = new_dir
+            else:
+                new_pits[(px, py)] = new_dir
+
+        # Update pit tracking
+        self.pit_directions = new_pits
+        # Update the pits list
+        self.pits = list(new_pits.keys())
+
+    # ── Public API ────────────────────────────────────────────────────────────
     def reset(self) -> Tuple[int, int]:
         self.current_pos = self.start_pos
         self.turns_taken = 0
@@ -186,74 +227,72 @@ class MazeEnvironment:
         self.is_confused = False
         self.confusion_turns_left = 0
         self.goal_reached = False
+        self.total_actions_taken = 0
+        # Reset fire positions
+        self.pit_directions = {}
+        for p in self.pits:
+            self.pit_directions[p] = 0
         return self.current_pos
-        
+
     def step(self, actions: List[Action]) -> TurnResult:
         if not actions or len(actions) > 5:
-            raise ValueError("Actions list must contain between 1 and 5 actions")
-            
+            raise ValueError("Must provide 1-5 actions per turn")
+
         result = TurnResult()
-        
-        # Check confusion expiration before the turn execution starts
+
+        # Handle confusion carry-over
         if self.confusion_turns_left > 0:
             self.confusion_turns_left -= 1
             if self.confusion_turns_left == 0:
                 self.is_confused = False
-                
+
         for act in actions:
             result.actions_executed += 1
-            
-            # Invert action if currently confused
-            effective_action = act
-            if self.is_confused:
-                if act == Action.MOVE_UP: effective_action = Action.MOVE_DOWN
-                elif act == Action.MOVE_DOWN: effective_action = Action.MOVE_UP
-                elif act == Action.MOVE_LEFT: effective_action = Action.MOVE_RIGHT
-                elif act == Action.MOVE_RIGHT: effective_action = Action.MOVE_LEFT
-                
+            self.total_actions_taken += 1
+
+            # Fire rotation every 5 actions
+            if self.total_actions_taken > 0 and self.total_actions_taken % 5 == 0:
+                self._rotate_fires()
+
+            # Confusion inversion
+            effective = CONFUSED_MAP[act] if self.is_confused else act
+
             x, y = self.current_pos
-            
-            if effective_action == Action.WAIT:
+
+            if effective == Action.WAIT:
                 pass
-            elif effective_action in [Action.MOVE_UP, Action.MOVE_DOWN, Action.MOVE_LEFT, Action.MOVE_RIGHT]:
-                if self._has_wall(x, y, effective_action):
+            elif effective in (Action.MOVE_UP, Action.MOVE_DOWN, Action.MOVE_LEFT, Action.MOVE_RIGHT):
+                if self._has_wall(x, y, effective):
                     result.wall_hits += 1
                 else:
-                    if effective_action == Action.MOVE_UP: y -= 1
-                    elif effective_action == Action.MOVE_DOWN: y += 1
-                    elif effective_action == Action.MOVE_LEFT: x -= 1
-                    elif effective_action == Action.MOVE_RIGHT: x += 1
+                    dx, dy = ACTION_DELTA[effective]
+                    x, y = x + dx, y + dy
                     self.current_pos = (x, y)
                     self.cells_explored.add((x, y))
-            
-            # Recheck attributes based on new position
-            cell_type = self._get_cell(x, y)
-            
-            if cell_type == 'P':
+
+            # Check cell effects
+            if self._is_pit(x, y):
                 result.is_dead = True
                 self.deaths += 1
-                self.current_pos = self.start_pos # respawn at start next turn
-                break # death ends the turn execution
-                
-            if cell_type == 'G':
+                self.current_pos = self.start_pos
+                break
+
+            if (x, y) == self.goal:
                 result.is_goal_reached = True
                 self.goal_reached = True
-                break # goal ends execution
-                
-            if cell_type == 'T':
-                # Deterministic teleportation
-                if (x, y) in self.teleport_map:
-                    result.teleported = True
-                    self.current_pos = self.teleport_map[(x, y)]
-                    x, y = self.current_pos
-                    self.cells_explored.add((x, y))
-                
-            if cell_type == 'C':
-                # Apply confusion for rest of this turn and the following turn
+                break
+
+            if (x, y) in self.teleport_map:
+                result.teleported = True
+                self.current_pos = self.teleport_map[(x, y)]
+                x, y = self.current_pos
+                self.cells_explored.add((x, y))
+
+            if (x, y) in [(cx, cy) for cx, cy in self.confusion_pads]:
                 result.is_confused = True
                 self.is_confused = True
                 self.confused_count += 1
-                self.confusion_turns_left = 1 # 1 because it's the following turn (it applies dynamically to the rest of the actions in this turn implicitly)
+                self.confusion_turns_left = 1
 
         result.current_position = self.current_pos
         self.turns_taken += 1
