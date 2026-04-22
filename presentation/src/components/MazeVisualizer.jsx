@@ -29,7 +29,15 @@ const MazeVisualizer = () => {
     return () => clearInterval(timerRef.current);
   }, [isPlaying, maxSteps, speed]);
 
-  const togglePlay = () => setIsPlaying(!isPlaying);
+  const togglePlay = () => {
+    if (!isPlaying && currentStep >= maxSteps) {
+      setCurrentStep(0);
+      setIsPlaying(true);
+    } else {
+      setIsPlaying(!isPlaying);
+    }
+  };
+  
   const reset = () => {
     setIsPlaying(false);
     setCurrentStep(0);
