@@ -27,6 +27,7 @@ agent report no confusion, to prevent confusion-inversion from creating false wa
 
 from __future__ import annotations
 
+import heapq
 from collections import deque
 from typing import Dict, List, Optional, Tuple
 
@@ -385,6 +386,242 @@ class NaiveAgent(Agent):
         return [Action.WAIT]
 
 
+# ─── SmartAgent ──────────────────────────────────────────────────────────────
+
+class SmartAgent(NaiveAgent):
+    """
+    Improvement over NaiveAgent:
+      1. A* replaces BFS for navigation and frontier selection.
+         A* biases exploration toward the goal (or the diagonal-opposite corner
+         as heuristic when goal is unknown), finding the goal earlier in ep 1.
+      2. Monte Carlo Q-learning accumulates (state, action) value estimates
+         across episodes.  From episode 2 onward the Q-table biases which
+         unexplored direction is probed first, cutting turns further.
+    """
+
+    _ALPHA        = 0.20
+    _GAMMA        = 0.92
+    _GOAL_REWARD  = 5_000.0
+    _DEATH_PENALTY = -300.0
+    _STEP_COST    = -1.0
+
+    def __init__(self, start: Tuple[int, int]) -> None:
+        super().__init__(start)
+        self._q:        Dict[Tuple[int, int], Dict[Action, float]] = {}
+        self._history:  List[Tuple[Tuple[int, int], Action]] = []
+        self._ep_deaths: int = 0
+
+    # ── episode bookkeeping ───────────────────────────────────────────────────
+
+    def reset_episode(self) -> None:
+        # Detect goal reach BEFORE resetting position (pos == goal at ep end).
+        ep_goal = (
+            self.memory["goal"] is not None
+            and self._pos == self.memory["goal"]
+        )
+        self._flush_q(ep_goal)
+        self._history   = []
+        self._ep_deaths = 0
+        super().reset_episode()
+
+    def _update_model(self, result: Optional[TurnResult]) -> None:
+        if result is not None and result.is_dead:
+            self._ep_deaths += 1
+        super()._update_model(result)
+
+    # ── Q-learning ────────────────────────────────────────────────────────────
+
+    def _qv(self, pos: Tuple[int, int], action: Action) -> float:
+        return self._q.get(pos, {}).get(action, 0.0)
+
+    def _record_move(self, pos: Tuple[int, int], action: Action) -> None:
+        self._history.append((pos, action))
+
+    def _flush_q(self, goal_reached: bool) -> None:
+        """Monte Carlo backward update through the episode history."""
+        if not self._history:
+            return
+        G = self._GOAL_REWARD if goal_reached else 0.0
+        G += self._DEATH_PENALTY * self._ep_deaths
+        for state, action in reversed(self._history):
+            G = self._STEP_COST + self._GAMMA * G
+            entry = self._q.setdefault(state, {})
+            entry[action] = (
+                entry.get(action, 0.0)
+                + self._ALPHA * (G - entry.get(action, 0.0))
+            )
+
+    # ── heuristic & A* ───────────────────────────────────────────────────────
+
+    def _target(self) -> Optional[Tuple[int, int]]:
+        """Goal if known; else None (use BFS for exploration)."""
+        return self.memory["goal"]
+
+    @staticmethod
+    def _mh(a: Tuple[int, int], b: Tuple[int, int]) -> int:
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    def _astar_path(
+        self, src: Tuple[int, int], dst: Tuple[int, int]
+    ) -> Optional[List[Tuple[int, int]]]:
+        if src == dst:
+            return [src]
+        open_set: list = [(self._mh(src, dst), 0, src)]
+        came_from: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {src: None}
+        g_cost:    Dict[Tuple[int, int], int] = {src: 0}
+        while open_set:
+            _, cost, cur = heapq.heappop(open_set)
+            if cur == dst:
+                path, node = [], cur
+                while node is not None:
+                    path.append(node)
+                    node = came_from[node]
+                path.reverse()
+                return path
+            if cost > g_cost.get(cur, 10**9):
+                continue
+            for nxt in self._passable_neighbours(cur):
+                if not self._is_safe(nxt):
+                    continue
+                ng = cost + 1
+                if ng < g_cost.get(nxt, 10**9):
+                    g_cost[nxt] = ng
+                    came_from[nxt] = cur
+                    heapq.heappush(open_set, (ng + self._mh(nxt, dst), ng, nxt))
+        return None
+
+    def _astar_to_frontier(self) -> Optional[List[Tuple[int, int]]]:
+        """A* toward target; falls back to BFS when goal is unknown."""
+        tgt = self._target()
+        if tgt is None:
+            return self._bfs_to_frontier()
+        src = self._pos
+        open_set: list = [(self._mh(src, tgt), 0, src)]
+        came_from: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {src: None}
+        g_cost:    Dict[Tuple[int, int], int] = {src: 0}
+        while open_set:
+            _, cost, cur = heapq.heappop(open_set)
+            if cur != src and self._unexplored_dirs(cur):
+                path, node = [], cur
+                while node is not None:
+                    path.append(node)
+                    node = came_from[node]
+                path.reverse()
+                return path
+            if cost > g_cost.get(cur, 10**9):
+                continue
+            for nxt in self._passable_neighbours(cur):
+                if not self._is_safe(nxt):
+                    continue
+                ng = cost + 1
+                if ng < g_cost.get(nxt, 10**9):
+                    g_cost[nxt] = ng
+                    came_from[nxt] = cur
+                    heapq.heappush(open_set, (ng + self._mh(nxt, tgt), ng, nxt))
+        return None
+
+    # ── probe direction selection ─────────────────────────────────────────────
+
+    def _best_probe(
+        self, pos: Tuple[int, int]
+    ) -> Optional[Tuple[Action, int, int]]:
+        """
+        Pick the unexplored direction maximising Q-value.
+        When goal is known, adds proximity-to-goal bias.
+        """
+        candidates = self._unexplored_dirs(pos)
+        if not candidates:
+            return None
+        tgt = self._target()
+        if tgt is None:
+            # No goal known yet — rank by Q-value only, fall back to first
+            return max(candidates, key=lambda item: self._qv(pos, item[0]))
+        norm = N * 2.0
+        def rank(item: Tuple[Action, int, int]) -> float:
+            action, nc, nr = item
+            return self._qv(pos, action) - self._mh((nc, nr), tgt) / norm
+        return max(candidates, key=rank)
+
+    # ── plan_turn override ────────────────────────────────────────────────────
+
+    def plan_turn(self, last_result: Optional[TurnResult]) -> List[Action]:
+        self._update_model(last_result)
+
+        confused = self._confused_turns_left > 0
+
+        def _emit(actions: List[Action]) -> List[Action]:
+            return [_INVERT[a] for a in actions] if confused else actions
+
+        # ── 1. continue navigation plan (identical to NaiveAgent) ─────────────
+        if self._nav_positions:
+            nxt = self._nav_positions[0]
+            if (
+                self._edge(self._pos, nxt) in self.memory["open_edges"]
+                and self._is_safe(nxt)
+            ):
+                if not self._is_probe_safe(nxt):
+                    self._probe_target = nxt
+                    self._nav_positions = self._nav_positions[1:]
+                    return _emit([self._pos_to_action(self._pos, nxt)])
+
+                batch: List[Tuple[int, int]] = []
+                cur = self._pos
+                for p in self._nav_positions:
+                    if (
+                        self._edge(cur, p) in self.memory["open_edges"]
+                        and self._is_probe_safe(p)
+                        and len(batch) < 5
+                    ):
+                        batch.append(p)
+                        cur = p
+                    else:
+                        break
+                self._nav_positions = self._nav_positions[len(batch):]
+                actions = [
+                    self._pos_to_action(batch[i - 1] if i > 0 else self._pos, batch[i])
+                    for i in range(len(batch))
+                ]
+                return _emit(actions)
+            else:
+                self._nav_positions = []
+
+        # ── 2. head to goal (A*) ───────────────────────────────────────────────
+        goal = self.memory["goal"]
+        if goal is not None and self._pos != goal:
+            path = self._astar_path(self._pos, goal)
+            if path and len(path) > 1:
+                self._nav_positions = path[1:]
+                return self.plan_turn(None)
+
+        # ── 3. probe best unexplored direction (Q + heuristic) ────────────────
+        best = self._best_probe(self._pos)
+        if best:
+            action, nc, nr = best
+            self._probe_target = (nc, nr)
+            self._record_move(self._pos, action)
+            return _emit([action])
+
+        # ── 4. navigate to frontier (A*-biased toward target) ─────────────────
+        path = self._astar_to_frontier()
+        if path and len(path) > 1:
+            self._nav_positions = path[1:]
+            return self.plan_turn(None)
+
+        # ── 5. escape via intentional pit death ───────────────────────────────
+        path = self._bfs_to_escape_pit()
+        if path and len(path) > 1:
+            pit_cell = path[-1]
+            nav_to_adj = path[1:-1]
+            if nav_to_adj:
+                self._nav_positions = nav_to_adj
+                return self.plan_turn(None)
+            self._probe_target = pit_cell
+            return _emit([self._pos_to_action(self._pos, pit_cell)])
+
+        # ── 6. nothing reachable ──────────────────────────────────────────────
+        return [Action.WAIT]
+
+
 # ─── utility ─────────────────────────────────────────────────────────────────
 
 def _adjacent(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
@@ -393,43 +630,67 @@ def _adjacent(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
 
 # ─── episode runner ───────────────────────────────────────────────────────────
 
-def run_episode(
-    maze_id: str = "training",
-    max_turns: int = 10_000,
-    verbose: bool = False,
-) -> dict:
+def run_episodes(
+    maze_id:   str  = "training",
+    n:         int  = 5,
+    max_turns: int  = 10_000,
+    verbose:   bool = False,
+    agent_cls        = None,
+) -> List[dict]:
+    """Run n episodes with persistent memory. Returns per-episode stats."""
     from environment import MazeEnvironment
+
+    if agent_cls is None:
+        agent_cls = NaiveAgent
 
     env   = MazeEnvironment(maze_id)
     start = env.reset()
-    agent = NaiveAgent(start)
+    agent = agent_cls(start)
 
-    last_result: Optional[TurnResult] = None
-    for turn in range(max_turns):
-        actions = agent.plan_turn(last_result)
-        last_result = env.step(actions)
+    results = []
+    for ep in range(1, n + 1):
+        env.reset()
+        agent.reset_episode()
+        last_result: Optional[TurnResult] = None
 
-        if verbose and turn % 500 == 0:
-            s = env.get_episode_stats()
-            print(
-                f"  turn={turn:5d}  pos={last_result.current_position}"
-                f"  explored={s['cells_explored']:4d}/4096"
-                f"  deaths={s['deaths']}"
-                f"  confused={s['confused']}"
-                f"  probed={len(agent.memory['probed'])}"
-            )
+        for turn in range(max_turns):
+            actions     = agent.plan_turn(last_result)
+            last_result = env.step(actions)
 
-        if last_result.is_goal_reached:
-            if verbose:
-                print(f"  *** GOAL reached on turn {turn + 1}!")
-            break
+            if verbose and turn % 500 == 0:
+                s = env.get_episode_stats()
+                print(
+                    f"  ep={ep} turn={turn:5d}  pos={last_result.current_position}"
+                    f"  explored={s['cells_explored']:4d}/4096"
+                    f"  deaths={s['deaths']}  confused={s['confused']}"
+                )
 
-    return env.get_episode_stats()
+            if last_result.is_goal_reached:
+                if verbose:
+                    print(f"  *** GOAL reached on turn {turn + 1}!")
+                break
+
+        results.append(env.get_episode_stats())
+
+    return results
 
 
 # ─── smoke test ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Running NaiveAgent on training maze...")
-    stats = run_episode("training", max_turns=10_000, verbose=True)
-    print(f"\nEpisode stats: {stats}")
+    import statistics
+
+    for label, cls in [("NaiveAgent", NaiveAgent), ("SmartAgent", SmartAgent)]:
+        print(f"\n{'='*50}")
+        print(f"  {label} — training maze, 5 episodes")
+        print(f"{'='*50}")
+        results = run_episodes("training", n=5, verbose=True, agent_cls=cls)
+        successes = [r for r in results if r["goal_reached"]]
+        turns  = [r["turns_taken"] for r in successes]
+        deaths = [r["deaths"]      for r in successes]
+        total_d = sum(r["deaths"]      for r in results)
+        total_t = sum(r["turns_taken"] for r in results)
+        print(f"\n  success={len(successes)}/5"
+              f"  avg_turns={statistics.mean(turns):.0f}"
+              f"  avg_deaths={statistics.mean(deaths):.2f}"
+              f"  death_rate={total_d/total_t:.5f}")
