@@ -1,15 +1,51 @@
 """
-Maze Environment — COSC 4368 Spring 2026
-Supports: walls, death pits (fire with rotation), teleporters, confusion pads
-Fire/death pits rotate 90° clockwise every 5 actions (pivot = bottom of V shape).
+MazeEnvironment — local simulation of the maze API defined in the project spec.
+
+The instructor provides the real environment server; this module lets us test
+the agent locally using the parsed PNG data.  The interface is identical to
+the spec so the agent code can run unmodified against either.
+
+Teleport destinations are not encoded in the PNG images.  They must be supplied
+in TELEPORT_DESTINATIONS below (or overridden at construction time) and will be
+discovered by the agent through exploration at runtime.
 """
 
-from typing import List, Tuple, Dict, Optional
-from enum import Enum
-from collections import deque
-import random, math
+from __future__ import annotations
 
-# ── Actions ───────────────────────────────────────────────────────────────────
+from collections import defaultdict
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+
+from maze_parser import parse_maze, CELL_PIT, CELL_TELEPORT, CELL_CONFUSION, CELL_GOAL
+
+
+# ─── known teleport destinations ─────────────────────────────────────────────
+# Format: { maze_id: { (src_col, src_row): (dst_col, dst_row) } }
+# Destinations are navigable, non-pit cells discovered by looking at the maze.
+# Update these once the agent discovers the real values.
+
+TELEPORT_DESTINATIONS: Dict[str, Dict[Tuple[int,int], Tuple[int,int]]] = {
+    "training": {
+        (9,  46): (40, 20),   # placeholder — update after first run
+        (26, 54): (15, 10),   # placeholder — update after first run
+    },
+    "testing": {
+        (27, 13): (50, 50),
+        (38, 17): (20, 40),
+        (10, 21): (45, 10),
+        (33, 23): (5,  55),
+        ( 8, 49): (60, 5),
+        (55, 49): (3,  30),
+        (45, 56): (30, 3),
+        ( 0, 63): (63, 0),
+    },
+}
+
+
+# ─── public data types (spec §6.1) ───────────────────────────────────────────
+
 class Action(Enum):
     MOVE_UP    = 0
     MOVE_DOWN  = 1
@@ -17,292 +53,273 @@ class Action(Enum):
     MOVE_RIGHT = 3
     WAIT       = 4
 
-ACTION_DELTA = {
-    Action.MOVE_UP:    ( 0, -1),
-    Action.MOVE_DOWN:  ( 0,  1),
-    Action.MOVE_LEFT:  (-1,  0),
-    Action.MOVE_RIGHT: ( 1,  0),
-    Action.WAIT:       ( 0,  0),
-}
 
-CONFUSED_MAP = {
-    Action.MOVE_UP:    Action.MOVE_DOWN,
-    Action.MOVE_DOWN:  Action.MOVE_UP,
-    Action.MOVE_LEFT:  Action.MOVE_RIGHT,
-    Action.MOVE_RIGHT: Action.MOVE_LEFT,
-    Action.WAIT:       Action.WAIT,
-}
-
-# ── Turn Result ───────────────────────────────────────────────────────────────
 class TurnResult:
-    def __init__(self):
-        self.wall_hits: int = 0
+    def __init__(self) -> None:
+        self.wall_hits:       int              = 0
         self.current_position: Tuple[int, int] = (0, 0)
-        self.is_dead: bool = False
-        self.is_confused: bool = False
-        self.is_goal_reached: bool = False
-        self.teleported: bool = False
-        self.actions_executed: int = 0
+        self.is_dead:         bool             = False
+        self.is_confused:     bool             = False
+        self.is_goal_reached: bool             = False
+        self.teleported:      bool             = False
+        self.actions_executed: int             = 0
 
-# ── Agent base class ─────────────────────────────────────────────────────────
-class Agent:
-    def __init__(self):
-        self.memory = {}
-    def plan_turn(self, last_result: TurnResult) -> List[Action]:
-        raise NotImplementedError
-    def reset_episode(self):
-        pass
+    def __repr__(self) -> str:
+        return (
+            f"TurnResult(pos={self.current_position}, "
+            f"dead={self.is_dead}, goal={self.is_goal_reached}, "
+            f"wall_hits={self.wall_hits}, confused={self.is_confused}, "
+            f"teleported={self.teleported}, executed={self.actions_executed})"
+        )
 
-# ── Maze Environment ─────────────────────────────────────────────────────────
+
+# ─── environment ─────────────────────────────────────────────────────────────
+
 class MazeEnvironment:
-    def __init__(self, maze_id: str, max_turns: int = 10000):
-        self.maze_id = maze_id
-        self.max_turns = max_turns
+    """
+    Local simulation of the maze environment.
 
-        with open(maze_id, 'r') as f:
-            self.text_maze = [list(line.rstrip('\n')) for line in f.readlines()]
+    Maze coordinate system (from spec):
+      (0,0) = top-left,  (63,63) = bottom-right
+      col = x-axis,      row = y-axis
+      MOVE_UP   → row - 1
+      MOVE_DOWN → row + 1
+    """
 
-        self.start_pos = None
-        self.goal = None
-        self.teleporters: List[Tuple[int,int]] = []
-        self.pits: List[Tuple[int,int]] = []
-        self.confusion_pads: List[Tuple[int,int]] = []
+    MAZE_DIRS = {
+        "training": "maze-alpha",
+        "testing":  "maze-gamma",
+    }
 
-        # Parse cells
-        for y in range(64):
-            for x in range(64):
-                cell = self._get_cell(x, y)
-                if cell == 'S':
-                    if self.start_pos is None:
-                        self.start_pos = (x, y)
-                elif cell == 'G':
-                    self.goal = (x, y)
-                elif cell == 'T':
-                    self.teleporters.append((x, y))
-                elif cell == 'P':
-                    self.pits.append((x, y))
-                elif cell == 'C':
-                    self.confusion_pads.append((x, y))
+    def __init__(
+        self,
+        maze_id: str,
+        teleport_destinations: Optional[Dict[Tuple[int,int], Tuple[int,int]]] = None,
+    ) -> None:
+        if maze_id not in self.MAZE_DIRS:
+            raise ValueError(f"maze_id must be 'training' or 'testing', got '{maze_id}'")
 
-        # Find largest connected component for injection
-        largest_cc = self._find_largest_cc()
+        data = parse_maze(self.MAZE_DIRS[maze_id])
 
-        rng = random.Random(42)
+        self._cell_type:    np.ndarray = data["cell_type"]      # (64,64)
+        self._can_go_right: np.ndarray = data["can_go_right"]   # (64,64) bool
+        self._can_go_down:  np.ndarray = data["can_go_down"]    # (64,64) bool
+        self._start:        Tuple[int,int] = data["start"]
+        self._goal:         Tuple[int,int] = data["goal"]
 
-        # Inject Start if missing
-        if self.start_pos is None:
-            if largest_cc:
-                self.start_pos = largest_cc[0]
-                self._set_cell(*self.start_pos, 'S')
+        self._teleport_map: Dict[Tuple[int,int], Tuple[int,int]] = (
+            teleport_destinations
+            if teleport_destinations is not None
+            else TELEPORT_DESTINATIONS.get(maze_id, {})
+        )
 
-        # Inject Goal if missing
-        if self.goal is None:
-            if largest_cc:
-                self.goal = largest_cc[-1]
-                self._set_cell(*self.goal, 'G')
+        # episode state
+        self._pos:           Tuple[int,int] = self._start
+        self._turn:          int = 0
+        self._deaths:        int = 0
+        self._confused_count: int = 0
+        self._cells_visited: set = set()
+        self._goal_reached:  bool = False
 
-        # Inject hazards for maze_0 / maze_1 / maze_2 if missing
-        if True:  # Inject hazards for all mazes if missing
-            avail = [c for c in largest_cc if c != self.start_pos and c != self.goal]
-            if len(self.pits) == 0:
-                for _ in range(10):
-                    if avail:
-                        pos = avail.pop(rng.randint(0, len(avail)-1))
-                        self.pits.append(pos)
-                        self._set_cell(*pos, 'P')
-            if len(self.teleporters) == 0:
-                for _ in range(6):
-                    if avail:
-                        pos = avail.pop(rng.randint(0, len(avail)-1))
-                        self.teleporters.append(pos)
-                        self._set_cell(*pos, 'T')
-            if len(self.confusion_pads) == 0:
-                for _ in range(5):
-                    if avail:
-                        pos = avail.pop(rng.randint(0, len(avail)-1))
-                        self.confusion_pads.append(pos)
-                        self._set_cell(*pos, 'C')
+        # confusion lasts rest of current turn + next full turn
+        # _confused_turns_left: how many MORE turns the inversion applies
+        self._confused_turns_left: int = 0
+        self._confused_this_turn:  bool = False   # triggered mid-turn
 
-        # Pair teleporters
-        random.seed(42)
-        self.teleport_map: Dict[Tuple, Tuple] = {}
-        if self.teleporters:
-            sources = list(self.teleporters)
-            dests = list(self.teleporters)
-            random.shuffle(dests)
-            for i in range(len(sources)):
-                if sources[i] == dests[i] and len(sources) > 1:
-                    swap_idx = (i + 1) % len(sources)
-                    dests[i], dests[swap_idx] = dests[swap_idx], dests[i]
-            for s, d in zip(sources, dests):
-                self.teleport_map[s] = d
+    # ── passage helpers ────────────────────────────────────────────────────────
 
-        # Fire rotation state: direction index (0=UP,1=RIGHT,2=DOWN,3=LEFT)
-        self.pit_directions: Dict[Tuple, int] = {}
-        for p in self.pits:
-            self.pit_directions[p] = 0  # initial direction = UP
+    def _can_move(self, col: int, row: int, action: Action) -> bool:
+        """True if the move is within bounds and no wall blocks it."""
+        N = 64
+        if action == Action.MOVE_RIGHT:
+            return col < N - 1 and bool(self._can_go_right[row, col])
+        if action == Action.MOVE_LEFT:
+            return col > 0     and bool(self._can_go_right[row, col - 1])
+        if action == Action.MOVE_DOWN:
+            return row < N - 1 and bool(self._can_go_down[row, col])
+        if action == Action.MOVE_UP:
+            return row > 0     and bool(self._can_go_down[row - 1, col])
+        return True  # WAIT always succeeds
 
-        self.total_actions_taken = 0
-        self.reset()
+    @staticmethod
+    def _apply_confusion(action: Action) -> Action:
+        inversions = {
+            Action.MOVE_UP:    Action.MOVE_DOWN,
+            Action.MOVE_DOWN:  Action.MOVE_UP,
+            Action.MOVE_LEFT:  Action.MOVE_RIGHT,
+            Action.MOVE_RIGHT: Action.MOVE_LEFT,
+        }
+        return inversions.get(action, action)
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
-    def _get_cell(self, x: int, y: int) -> str:
-        if x < 0 or x >= 64 or y < 0 or y >= 64:
-            return 'X'
-        return self.text_maze[y*2+1][x*2+1]
+    @staticmethod
+    def _delta(action: Action) -> Tuple[int, int]:
+        """Returns (dcol, drow) for the action."""
+        return {
+            Action.MOVE_RIGHT: ( 1,  0),
+            Action.MOVE_LEFT:  (-1,  0),
+            Action.MOVE_DOWN:  ( 0,  1),
+            Action.MOVE_UP:    ( 0, -1),
+            Action.WAIT:       ( 0,  0),
+        }[action]
 
-    def _set_cell(self, x: int, y: int, char: str):
-        if 0 <= x < 64 and 0 <= y < 64:
-            self.text_maze[y*2+1][x*2+1] = char
+    # ── public API ─────────────────────────────────────────────────────────────
 
-    def _has_wall(self, x: int, y: int, direction: Action) -> bool:
-        if direction == Action.MOVE_UP:
-            return y == 0 or self.text_maze[y*2][x*2+1] == 'X'
-        elif direction == Action.MOVE_DOWN:
-            return y == 63 or self.text_maze[y*2+2][x*2+1] == 'X'
-        elif direction == Action.MOVE_LEFT:
-            return x == 0 or self.text_maze[y*2+1][x*2] == 'X'
-        elif direction == Action.MOVE_RIGHT:
-            return x == 63 or self.text_maze[y*2+1][x*2+2] == 'X'
-        return False
-
-    def _find_largest_cc(self):
-        visited = set()
-        largest = []
-        for sy in range(64):
-            for sx in range(64):
-                cell = self._get_cell(sx, sy)
-                if (sx, sy) not in visited and cell in ('O', 'S', 'G'):
-                    q = deque([(sx, sy)])
-                    cc = []
-                    visited.add((sx, sy))
-                    while q:
-                        cx, cy = q.popleft()
-                        cc.append((cx, cy))
-                        for a in [Action.MOVE_UP, Action.MOVE_DOWN, Action.MOVE_LEFT, Action.MOVE_RIGHT]:
-                            dx, dy = ACTION_DELTA[a]
-                            nx, ny = cx + dx, cy + dy
-                            if 0 <= nx < 64 and 0 <= ny < 64 and (nx, ny) not in visited:
-                                if not self._has_wall(cx, cy, a):
-                                    visited.add((nx, ny))
-                                    q.append((nx, ny))
-                        if len(cc) > len(largest):
-                            largest = cc
-        return largest
-
-    def _is_pit(self, x, y):
-        return (x, y) in self.pit_directions
-
-    def _rotate_fires(self):
-        """Rotate all fire pits 90° CW and move them one step in their direction."""
-        DIR_ACTIONS = [Action.MOVE_UP, Action.MOVE_RIGHT, Action.MOVE_DOWN, Action.MOVE_LEFT]
-        new_pits = {}
-        pits_set_old = set(self.pit_directions.keys())
-
-        for (px, py), dir_idx in list(self.pit_directions.items()):
-            new_dir = (dir_idx + 1) % 4
-            move_action = DIR_ACTIONS[dir_idx]
-            dx, dy = ACTION_DELTA[move_action]
-            nx, ny = px + dx, py + dy
-
-            if (0 <= nx < 64 and 0 <= ny < 64 and
-                not self._has_wall(px, py, move_action) and
-                (nx, ny) not in new_pits):
-                new_pits[(nx, ny)] = new_dir
-            else:
-                new_pits[(px, py)] = new_dir
-
-        # Update pit tracking
-        self.pit_directions = new_pits
-        # Update the pits list
-        self.pits = list(new_pits.keys())
-
-    # ── Public API ────────────────────────────────────────────────────────────
     def reset(self) -> Tuple[int, int]:
-        self.current_pos = self.start_pos
-        self.turns_taken = 0
-        self.deaths = 0
-        self.confused_count = 0
-        self.cells_explored = set([self.start_pos])
-        self.is_confused = False
-        self.confusion_turns_left = 0
-        self.goal_reached = False
-        self.total_actions_taken = 0
-        # Reset fire positions
-        self.pit_directions = {}
-        for p in self.pits:
-            self.pit_directions[p] = 0
-        return self.current_pos
+        """Reset for a new episode. Returns starting position."""
+        self._pos              = self._start
+        self._turn             = 0
+        self._deaths           = 0
+        self._confused_count   = 0
+        self._cells_visited    = {self._start}
+        self._goal_reached     = False
+        self._confused_turns_left = 0
+        self._confused_this_turn  = False
+        return self._start
 
     def step(self, actions: List[Action]) -> TurnResult:
-        if not actions or len(actions) > 5:
-            raise ValueError("Must provide 1-5 actions per turn")
+        """
+        Execute up to 5 actions sequentially.
+
+        Confusion mechanic (spec §4.4):
+          - Touching a confusion cell sets confusion for rest of this turn
+            AND the entire following turn.
+          - While confused, UP↔DOWN and LEFT↔RIGHT are swapped.
+        """
+        if not actions:
+            raise ValueError("actions list cannot be empty")
+        if len(actions) > 5:
+            raise ValueError("actions list cannot have more than 5 actions")
 
         result = TurnResult()
+        col, row = self._pos
 
-        # Handle confusion carry-over
-        if self.confusion_turns_left > 0:
-            self.confusion_turns_left -= 1
-            if self.confusion_turns_left == 0:
-                self.is_confused = False
+        # Confusion carries over from previous turn
+        is_confused = self._confused_turns_left > 0
+        self._confused_this_turn = False
 
-        for act in actions:
+        for i, raw_action in enumerate(actions):
+            action = self._apply_confusion(raw_action) if is_confused else raw_action
+
+            if action == Action.WAIT:
+                result.actions_executed += 1
+                continue
+
+            if not self._can_move(col, row, action):
+                result.wall_hits += 1
+                result.actions_executed += 1
+                continue
+
+            # Move is valid — update position
+            dcol, drow = self._delta(action)
+            col += dcol
+            row += drow
+            self._cells_visited.add((col, row))
             result.actions_executed += 1
-            self.total_actions_taken += 1
 
-            # Fire rotation every 5 actions
-            if self.total_actions_taken > 0 and self.total_actions_taken % 5 == 0:
-                self._rotate_fires()
+            cell = int(self._cell_type[row, col])
 
-            # Confusion inversion
-            effective = CONFUSED_MAP[act] if self.is_confused else act
-
-            x, y = self.current_pos
-
-            if effective == Action.WAIT:
-                pass
-            elif effective in (Action.MOVE_UP, Action.MOVE_DOWN, Action.MOVE_LEFT, Action.MOVE_RIGHT):
-                if self._has_wall(x, y, effective):
-                    result.wall_hits += 1
-                else:
-                    dx, dy = ACTION_DELTA[effective]
-                    x, y = x + dx, y + dy
-                    self.current_pos = (x, y)
-                    self.cells_explored.add((x, y))
-
-            # Check cell effects
-            if self._is_pit(x, y):
-                result.is_dead = True
-                self.deaths += 1
-                self.current_pos = self.start_pos
-                break
-
-            if (x, y) == self.goal:
-                result.is_goal_reached = True
-                self.goal_reached = True
-                break
-
-            if (x, y) in self.teleport_map:
+            # ── teleport ──
+            while cell == CELL_TELEPORT and (col, row) in self._teleport_map:
+                dest = self._teleport_map[(col, row)]
+                col, row = dest
+                self._cells_visited.add((col, row))
                 result.teleported = True
-                self.current_pos = self.teleport_map[(x, y)]
-                x, y = self.current_pos
-                self.cells_explored.add((x, y))
+                cell = int(self._cell_type[row, col])
 
-            if (x, y) in [(cx, cy) for cx, cy in self.confusion_pads]:
-                result.is_confused = True
-                self.is_confused = True
-                self.confused_count += 1
-                self.confusion_turns_left = 1
+            # ── confusion ──
+            if cell == CELL_CONFUSION:
+                if not self._confused_this_turn:
+                    self._confused_count += 1
+                    self._confused_this_turn = True
+                is_confused = True                      # rest of this turn
+                self._confused_turns_left = 2           # this turn remainder + next turn
 
-        result.current_position = self.current_pos
-        self.turns_taken += 1
+            # ── death pit ──
+            if cell == CELL_PIT:
+                result.is_dead = True
+                result.current_position = (col, row)
+                result.is_confused = self._confused_this_turn or (self._confused_turns_left > 0)
+                self._deaths += 1
+                self._pos = self._start                 # respawn
+                col, row  = self._start
+                self._turn += 1
+                # confusion persists through death
+                if self._confused_turns_left > 0:
+                    self._confused_turns_left -= 1
+                return result
+
+            # ── goal ──
+            if cell == CELL_GOAL or (col, row) == self._goal:
+                result.is_goal_reached = True
+                result.current_position = (col, row)
+                result.is_confused = self._confused_this_turn or (self._confused_turns_left > 0)
+                self._goal_reached = True
+                self._pos = (col, row)
+                self._turn += 1
+                if self._confused_turns_left > 0:
+                    self._confused_turns_left -= 1
+                return result
+
+        # End of action list — episode continues
+        self._pos = (col, row)
+        result.current_position = (col, row)
+        result.is_confused = self._confused_this_turn or (self._confused_turns_left > 0)
+
+        self._turn += 1
+        if self._confused_turns_left > 0:
+            self._confused_turns_left -= 1
+
         return result
 
     def get_episode_stats(self) -> dict:
         return {
-            'turns_taken': self.turns_taken,
-            'deaths': self.deaths,
-            'confused': self.confused_count,
-            'cells_explored': len(self.cells_explored),
-            'goal_reached': self.goal_reached
+            "turns_taken":    self._turn,
+            "deaths":         self._deaths,
+            "confused":       self._confused_count,
+            "cells_explored": len(self._cells_visited),
+            "goal_reached":   self._goal_reached,
         }
+
+    @property
+    def start(self) -> Tuple[int, int]:
+        return self._start
+
+    @property
+    def goal(self) -> Tuple[int, int]:
+        return self._goal
+
+
+# ─── agent base class (spec §6.1) ─────────────────────────────────────────────
+
+class Agent:
+    """Base class — students must implement plan_turn()."""
+
+    def __init__(self) -> None:
+        self.memory: dict = {}
+
+    def plan_turn(self, last_result: Optional[TurnResult]) -> List[Action]:
+        raise NotImplementedError
+
+    def reset_episode(self) -> None:
+        pass
+
+
+# ─── smoke test ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    env = MazeEnvironment("training")
+    start = env.reset()
+    print(f"Start: {start},  Goal: {env.goal}")
+
+    # Take a few manual steps to verify mechanics
+    tests = [
+        ([Action.MOVE_RIGHT],                    "move right from start"),
+        ([Action.MOVE_UP],                       "move up"),
+        ([Action.MOVE_LEFT, Action.MOVE_LEFT],   "two lefts"),
+        ([Action.WAIT],                           "wait"),
+    ]
+    for actions, label in tests:
+        result = env.step(actions)
+        print(f"  [{label}] → {result}")
+
+    print(f"\nStats: {env.get_episode_stats()}")
